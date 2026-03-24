@@ -1,0 +1,1370 @@
+import React, { useEffect, useMemo, useState } from "react";
+import { motion } from "framer-motion";
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { Badge } from "@/components/ui/badge";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Switch } from "@/components/ui/switch";
+import { Separator } from "@/components/ui/separator";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Slider } from "@/components/ui/slider";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import {
+  Activity,
+  Cable,
+  Database,
+  Disc3,
+  Orbit,
+  Play,
+  Radio,
+  RefreshCcw,
+  Save,
+  Send,
+  Settings2,
+  TimerReset,
+  Waves,
+  Bot,
+  Sparkles,
+} from "lucide-react";
+
+type TrackConfig = {
+  track_index: number;
+  clip_index: number;
+  name_suffix: string;
+};
+
+type MacroConfig = {
+  track_index: number;
+  device_index: number;
+  parameter_index: number;
+};
+
+type TemplateShape = {
+  name: string;
+  tracks: Record<string, TrackConfig>;
+  macros: Record<string, MacroConfig>;
+  launch_on_push: boolean;
+};
+
+type SavedTemplateRecord = {
+  template_id?: string;
+  user_id?: string;
+  name: string;
+  template: TemplateShape;
+  created_at?: string;
+  updated_at?: string;
+};
+
+type OscMessage = {
+  address: string;
+  args: (string | number | boolean)[];
+};
+
+type TimelineEvent = {
+  id: string;
+  ts: string;
+  type: string;
+  summary: string;
+  payload?: any;
+};
+
+type CompareState = {
+  a: any | null;
+  b: any | null;
+};
+
+type AutonomousDecision = {
+  id: string;
+  ts: string;
+  sourceEventId?: string;
+  action: "mutate_energy" | "replay_osc" | "re_export_midi" | "prepare_live_session";
+  reason: string;
+  confidence: number;
+  nextEnergy?: number;
+  payload?: any;
+};
+
+const builtInTemplates: TemplateShape[] = [
+  {
+    name: "default_three_track",
+    tracks: {
+      lead: { track_index: 0, clip_index: 0, name_suffix: "lead" },
+      bass: { track_index: 1, clip_index: 0, name_suffix: "bass" },
+      drums: { track_index: 2, clip_index: 0, name_suffix: "drums" },
+    },
+    macros: {
+      lead_filter: { track_index: 0, device_index: 0, parameter_index: 0 },
+      lead_drive: { track_index: 0, device_index: 0, parameter_index: 1 },
+      lead_reverb: { track_index: 0, device_index: 1, parameter_index: 0 },
+    },
+    launch_on_push: true,
+  },
+  {
+    name: "performance_four_track",
+    tracks: {
+      lead: { track_index: 0, clip_index: 0, name_suffix: "lead" },
+      bass: { track_index: 1, clip_index: 0, name_suffix: "bass" },
+      drums: { track_index: 2, clip_index: 0, name_suffix: "drums" },
+      fx: { track_index: 3, clip_index: 0, name_suffix: "fx" },
+    },
+    macros: {
+      lead_filter: { track_index: 0, device_index: 0, parameter_index: 0 },
+      lead_drive: { track_index: 0, device_index: 0, parameter_index: 1 },
+      lead_reverb: { track_index: 3, device_index: 0, parameter_index: 0 },
+    },
+    launch_on_push: true,
+  },
+];
+
+const DEFAULT_API_BASE = "http://127.0.0.1:8000";
+const DEFAULT_WS_BASE = "ws://127.0.0.1:8000";
+
+const initialTemplate = structuredClone(builtInTemplates[0]);
+const initialSection = {
+  section_name: "spiral_live_gold",
+  transport: { bpm: 148, time_signature: "4/4", swing: 0.06 },
+  automation: { filter_open: 0.78, drive: 0.52, reverb_mix: 0.23 },
+};
+
+function buildOscPreview(template: TemplateShape, section: typeof initialSection): OscMessage[] {
+  const messages: OscMessage[] = [];
+  messages.push({ address: "/live/song/set/tempo", args: [section.transport.bpm] });
+
+  Object.entries(template.tracks).forEach(([role, cfg]) => {
+    const clipName = `${section.section_name}_${cfg.name_suffix || role}`;
+    messages.push({ address: "/live/track/set/name", args: [cfg.track_index, clipName] });
+    messages.push({ address: "/live/clip/set/name", args: [cfg.track_index, cfg.clip_index, clipName] });
+    if (template.launch_on_push) {
+      messages.push({ address: "/live/clip/fire", args: [cfg.track_index, cfg.clip_index] });
+    }
+  });
+
+  const macroMap: Record<string, number> = {
+    lead_filter: section.automation.filter_open,
+    lead_drive: section.automation.drive,
+    lead_reverb: section.automation.reverb_mix,
+  };
+
+  Object.entries(template.macros).forEach(([name, cfg]) => {
+    const value = macroMap[name];
+    if (typeof value !== "number") return;
+    messages.push({
+      address: "/live/device/set/parameter/value",
+      args: [cfg.track_index, cfg.device_index, cfg.parameter_index, Number(value.toFixed(2))],
+    });
+  });
+
+  return messages;
+}
+
+function validateTemplateLocal(template: TemplateShape): string[] {
+  const errors: string[] = [];
+  if (!template.name.trim()) errors.push("Template name is required.");
+
+  const trackEntries = Object.entries(template.tracks);
+  if (!trackEntries.length) errors.push("At least one track is required.");
+
+  trackEntries.forEach(([name, cfg]) => {
+    if (cfg.track_index < 0) errors.push(`Track ${name}: track_index must be 0 or higher.`);
+    if (cfg.clip_index < 0) errors.push(`Track ${name}: clip_index must be 0 or higher.`);
+    if (!cfg.name_suffix.trim()) errors.push(`Track ${name}: name_suffix is required.`);
+  });
+
+  Object.entries(template.macros).forEach(([name, cfg]) => {
+    if (cfg.track_index < 0 || cfg.device_index < 0 || cfg.parameter_index < 0) {
+      errors.push(`Macro ${name}: indexes must be 0 or higher.`);
+    }
+  });
+
+  return errors;
+}
+
+async function api<T>(baseUrl: string, path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${baseUrl}${path}`, {
+    headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
+    ...init,
+  });
+
+  if (!res.ok) {
+    let message = `Request failed: ${res.status}`;
+    try {
+      const data = await res.json();
+      message = data?.detail
+        ? typeof data.detail === "string"
+          ? data.detail
+          : JSON.stringify(data.detail)
+        : JSON.stringify(data);
+    } catch {
+      // ignore
+    }
+    throw new Error(message);
+  }
+
+  return res.json();
+}
+
+export default function SpiralAbletonDashboardV5() {
+  const [template, setTemplate] = useState<TemplateShape>(initialTemplate);
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
+  const [apiBase, setApiBase] = useState(DEFAULT_API_BASE);
+  const [wsBase, setWsBase] = useState(DEFAULT_WS_BASE);
+  const [userId, setUserId] = useState("jon");
+  const [sessionId, setSessionId] = useState("session-gold-001");
+  const [oscHost, setOscHost] = useState("127.0.0.1");
+  const [oscPort, setOscPort] = useState("11000");
+  const [dryRun, setDryRun] = useState(true);
+  const [livePrompt, setLivePrompt] = useState("aggressive spiral live gold section for full launch");
+  const [energy, setEnergy] = useState([0.86]);
+
+  const [savedTemplates, setSavedTemplates] = useState<SavedTemplateRecord[]>([]);
+  const [backendValidation, setBackendValidation] = useState<string[]>([]);
+  const [previewMessages, setPreviewMessages] = useState<OscMessage[]>(buildOscPreview(initialTemplate, initialSection));
+  const [lastPayload, setLastPayload] = useState<any>(null);
+  const [latestSpiralState, setLatestSpiralState] = useState<any>(null);
+  const [latestOscPush, setLatestOscPush] = useState<any>(null);
+  const [latestMidiExport, setLatestMidiExport] = useState<any>(null);
+  const [currentMode, setCurrentMode] = useState<string>("-");
+  const [lastReply, setLastReply] = useState<string>("-");
+
+  const [status, setStatus] = useState("Idle");
+  const [error, setError] = useState("");
+  const [isBusy, setIsBusy] = useState(false);
+  const [wsConnected, setWsConnected] = useState(false);
+  const [wsEvents, setWsEvents] = useState<any[]>([]);
+  const [timeline, setTimeline] = useState<TimelineEvent[]>([]);
+  const [compareState, setCompareState] = useState<CompareState>({ a: null, b: null });
+  const [log, setLog] = useState<string[]>([
+    "Dashboard ready.",
+    "V5 adds autonomous loop mode, timeline actions, and live monitoring.",
+  ]);
+
+  const [autonomousMode, setAutonomousMode] = useState(false);
+  const [loopIntervalSec, setLoopIntervalSec] = useState(12);
+  const [qualityThreshold, setQualityThreshold] = useState(0.72);
+  const [autoMutateEnergy, setAutoMutateEnergy] = useState(true);
+  const [autonomousLog, setAutonomousLog] = useState<AutonomousDecision[]>([]);
+
+  const validationErrors = useMemo(() => validateTemplateLocal(template), [template]);
+
+  const pushLog = (entry: string) => {
+    setLog((prev) => [`${new Date().toLocaleTimeString()} — ${entry}`, ...prev].slice(0, 60));
+  };
+
+  const appendTimeline = (type: string, summary: string, payload?: any) => {
+    const event: TimelineEvent = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      ts: new Date().toLocaleTimeString(),
+      type,
+      summary,
+      payload,
+    };
+    setTimeline((prev) => [event, ...prev].slice(0, 200));
+  };
+
+  const appendAutonomousDecision = (decision: Omit<AutonomousDecision, "id" | "ts">) => {
+    const full: AutonomousDecision = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      ts: new Date().toLocaleTimeString(),
+      ...decision,
+    };
+    setAutonomousLog((prev) => [full, ...prev].slice(0, 100));
+    pushLog(`Autonomous action: ${full.action}`);
+  };
+
+  const clearError = () => setError("");
+
+  const modeColor = (mode: string) => {
+    if (mode === "act") return "bg-emerald-500/15 text-emerald-700 border-emerald-500/30";
+    if (mode === "reflect") return "bg-amber-500/15 text-amber-700 border-amber-500/30";
+    if (mode === "explore") return "bg-sky-500/15 text-sky-700 border-sky-500/30";
+    return "bg-muted text-muted-foreground border-border";
+  };
+
+  const connectionColor = wsConnected
+    ? "bg-emerald-500/15 text-emerald-700 border-emerald-500/30"
+    : "bg-rose-500/15 text-rose-700 border-rose-500/30";
+
+  const deriveEventScore = (payload: any) => {
+    const spiral = payload?.section?.spiral_snapshot || payload?.spiral_state || latestSpiralState;
+    const oscOk = payload?.osc_push?.status === "ok" || payload?.status === "ok";
+    const midiOk = payload?.midi_export?.status === "ok" || payload?.file_path;
+    const focus = Number(spiral?.focus ?? 0.5);
+    const confidence = Number(spiral?.confidence ?? 0.5);
+    const convergence = Number(spiral?.goal_convergence ?? 0.4);
+    const executionBonus = oscOk || midiOk ? 0.08 : 0;
+    return Math.max(0, Math.min(1, focus * 0.28 + confidence * 0.34 + convergence * 0.3 + executionBonus));
+  };
+
+  const selectBestTimelineEvent = () => {
+    const ranked = timeline
+      .map((item) => ({ item, score: deriveEventScore(item.payload) }))
+      .sort((a, b) => b.score - a.score);
+    return ranked[0] || null;
+  };
+
+  const mutatedEnergyFromBest = (base: number) => {
+    const delta = Math.random() * 0.16 - 0.08;
+    return Math.max(0, Math.min(1, Number((base + delta).toFixed(2))));
+  };
+
+  const loadUserTemplates = async () => {
+    setIsBusy(true);
+    clearError();
+    try {
+      const data = await api<{ templates: SavedTemplateRecord[] }>(apiBase, `/tools/ableton/templates/user/${encodeURIComponent(userId)}`);
+      setSavedTemplates(data.templates || []);
+      setStatus(`Loaded ${data.templates?.length || 0} saved templates`);
+      appendTimeline("templates_loaded", `Loaded ${data.templates?.length || 0} saved templates`, data.templates);
+      pushLog(`Fetched saved templates for ${userId}.`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Failed to load templates.";
+      setError(msg);
+      setStatus("Template load failed");
+      pushLog(`Template load failed: ${msg}`);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    loadUserTemplates();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const session = sessionId.trim();
+    if (!session) return;
+
+    let socket: WebSocket | null = null;
+    try {
+      socket = new WebSocket(`${wsBase}/ws/${encodeURIComponent(session)}`);
+      socket.onopen = () => {
+        setWsConnected(true);
+        setStatus("WebSocket connected");
+        pushLog(`WebSocket connected for session ${session}.`);
+      };
+      socket.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          setWsEvents((prev) => [data, ...prev].slice(0, 60));
+
+          if (data.type === "spiral_update" || data.type === "voice_update") {
+            setLatestSpiralState(data.payload?.spiral_state ?? null);
+            setCurrentMode(data.payload?.mode ?? "-");
+            setLastReply(data.payload?.reply ?? "-");
+            appendTimeline(data.type, `Mode ${data.payload?.mode ?? "-"} response received`, data.payload);
+          }
+
+          if (data.type === "ableton_osc_push") {
+            setLatestOscPush(data.payload ?? null);
+            appendTimeline("ableton_osc_push", "Ableton OSC push completed", data.payload);
+          }
+
+          if (data.type === "midi_export") {
+            setLatestMidiExport(data.payload ?? null);
+            appendTimeline("midi_export", "MIDI export completed", data.payload);
+          }
+
+          if (data.type === "live_session" || data.type === "autonomous_live_session") {
+            if (data.payload?.section?.spiral_snapshot) setLatestSpiralState(data.payload.section.spiral_snapshot);
+            if (data.payload?.osc_push) setLatestOscPush(data.payload.osc_push);
+            if (data.payload?.midi_export) setLatestMidiExport(data.payload.midi_export);
+            appendTimeline(data.type, "Live session pipeline executed", data.payload);
+          }
+
+          pushLog(`WS event: ${data.type || "unknown"}`);
+        } catch {
+          setWsEvents((prev) => [{ type: "raw", payload: event.data }, ...prev].slice(0, 60));
+          pushLog("WS raw event received.");
+        }
+      };
+      socket.onclose = () => {
+        setWsConnected(false);
+        pushLog(`WebSocket disconnected for session ${session}.`);
+      };
+      socket.onerror = () => {
+        setWsConnected(false);
+        pushLog("WebSocket error.");
+      };
+    } catch {
+      setWsConnected(false);
+    }
+
+    return () => {
+      if (socket) socket.close();
+    };
+  }, [wsBase, sessionId]);
+
+  const updateTrack = (role: string, key: keyof TrackConfig, value: string) => {
+    setTemplate((prev) => ({
+      ...prev,
+      tracks: {
+        ...prev.tracks,
+        [role]: {
+          ...prev.tracks[role],
+          [key]: key === "name_suffix" ? value : Number(value),
+        },
+      },
+    }));
+  };
+
+  const updateMacro = (name: string, key: keyof MacroConfig, value: string) => {
+    setTemplate((prev) => ({
+      ...prev,
+      macros: {
+        ...prev.macros,
+        [name]: {
+          ...prev.macros[name],
+          [key]: Number(value),
+        },
+      },
+    }));
+  };
+
+  const addTrack = () => {
+    const key = `track_${Object.keys(template.tracks).length}`;
+    setTemplate((prev) => ({
+      ...prev,
+      tracks: {
+        ...prev.tracks,
+        [key]: { track_index: 0, clip_index: 0, name_suffix: key },
+      },
+    }));
+    pushLog(`Added track mapping: ${key}`);
+  };
+
+  const addMacro = () => {
+    const key = `macro_${Object.keys(template.macros).length}`;
+    setTemplate((prev) => ({
+      ...prev,
+      macros: {
+        ...prev.macros,
+        [key]: { track_index: 0, device_index: 0, parameter_index: 0 },
+      },
+    }));
+    pushLog(`Added macro mapping: ${key}`);
+  };
+
+  const loadBuiltIn = (name: string) => {
+    const found = builtInTemplates.find((t) => t.name === name);
+    if (!found) return;
+    setTemplate(structuredClone(found));
+    setSelectedTemplateId(null);
+    setBackendValidation([]);
+    setPreviewMessages(buildOscPreview(found, initialSection));
+    pushLog(`Loaded built-in template '${name}'.`);
+  };
+
+  const loadSavedTemplate = (record: SavedTemplateRecord) => {
+    setTemplate(structuredClone(record.template));
+    setSelectedTemplateId(record.template_id || null);
+    setBackendValidation([]);
+    setPreviewMessages(buildOscPreview(record.template, initialSection));
+    pushLog(`Loaded saved template '${record.name}'.`);
+  };
+
+  const validateWithBackend = async () => {
+    setIsBusy(true);
+    clearError();
+    try {
+      const data = await api<{ valid: boolean; errors: string[] }>(apiBase, "/tools/ableton/templates/validate", {
+        method: "POST",
+        body: JSON.stringify(template),
+      });
+      setBackendValidation(data.errors || []);
+      setStatus(data.valid ? "Backend validation passed" : "Backend validation returned errors");
+      appendTimeline("template_validation", data.valid ? "Template validation passed" : "Template validation returned issues", data);
+      pushLog(data.valid ? "Backend validation passed." : `Backend validation found ${data.errors.length} issue(s).`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Backend validation failed.";
+      setError(msg);
+      setStatus("Validation failed");
+      pushLog(`Validation failed: ${msg}`);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const saveTemplate = async () => {
+    if (validationErrors.length) {
+      pushLog("Save blocked. Fix local validation errors first.");
+      return;
+    }
+    setIsBusy(true);
+    clearError();
+    try {
+      const data = await api<{ status: string; saved: SavedTemplateRecord }>(apiBase, "/tools/ableton/templates/save", {
+        method: "POST",
+        body: JSON.stringify({
+          user_id: userId,
+          name: template.name,
+          template,
+          template_id: selectedTemplateId,
+        }),
+      });
+      setSelectedTemplateId(data.saved.template_id || null);
+      setStatus(`Saved template '${data.saved.name}'`);
+      appendTimeline("template_saved", `Saved template '${data.saved.name}'`, data.saved);
+      pushLog(`Saved template '${data.saved.name}' to backend.`);
+      await loadUserTemplates();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Save failed.";
+      setError(msg);
+      setStatus("Save failed");
+      pushLog(`Save failed: ${msg}`);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const deleteTemplate = async () => {
+    if (!selectedTemplateId) {
+      pushLog("Delete skipped. No saved template selected.");
+      return;
+    }
+    setIsBusy(true);
+    clearError();
+    try {
+      await api(apiBase, "/tools/ableton/templates/delete", {
+        method: "POST",
+        body: JSON.stringify({ user_id: userId, template_id: selectedTemplateId }),
+      });
+      setSelectedTemplateId(null);
+      setStatus("Template deleted");
+      appendTimeline("template_deleted", "Deleted selected template", { template_id: selectedTemplateId });
+      pushLog("Deleted selected template from backend.");
+      await loadUserTemplates();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Delete failed.";
+      setError(msg);
+      setStatus("Delete failed");
+      pushLog(`Delete failed: ${msg}`);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const runDryPreview = async () => {
+    setIsBusy(true);
+    clearError();
+    try {
+      const data = await api<any>(apiBase, "/tools/music/push-ableton", {
+        method: "POST",
+        body: JSON.stringify({
+          user_id: userId,
+          session_id: sessionId,
+          prompt: livePrompt,
+          energy: Number(energy[0].toFixed(2)),
+          duration_bars: 16,
+          section_name: initialSection.section_name,
+          osc_host: oscHost,
+          osc_port: Number(oscPort),
+          template_id: selectedTemplateId,
+          template_overrides: template,
+          dry_run: true,
+        }),
+      });
+      setPreviewMessages(data.messages || []);
+      setLastPayload(data);
+      setStatus(`Dry run ready with ${data.messages?.length || 0} OSC messages`);
+      appendTimeline("dry_run", `Generated ${data.messages?.length || 0} OSC preview messages`, data);
+      pushLog("Fetched OSC dry-run preview from backend.");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Dry preview failed.";
+      setError(msg);
+      setStatus("Dry preview failed");
+      pushLog(`Dry preview failed: ${msg}`);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const launchLiveSession = async () => {
+    if (validationErrors.length) {
+      pushLog("Live launch blocked. Fix local validation errors first.");
+      return;
+    }
+    setIsBusy(true);
+    clearError();
+    try {
+      const payload = {
+        user_id: userId,
+        session_id: sessionId,
+        prompt: livePrompt,
+        energy: Number(energy[0].toFixed(2)),
+        duration_bars: 16,
+        section_name: initialSection.section_name,
+        output_dir: "exports",
+        osc_host: oscHost,
+        osc_port: Number(oscPort),
+        push_osc: true,
+        export_midi: true,
+        template_id: selectedTemplateId,
+        template_overrides: template,
+        dry_run: dryRun,
+      };
+      const data = await api<any>(apiBase, "/tools/music/live-session", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      setLastPayload(data);
+      setPreviewMessages(data?.osc_push?.messages || previewMessages);
+      setStatus(dryRun ? "Live-session dry run prepared" : "Live-session sent to backend");
+      appendTimeline("live_session_request", dryRun ? "Prepared live-session dry run" : "Triggered live-session backend route", data);
+      pushLog(dryRun ? "Prepared live-session dry run." : "Triggered live-session backend route.");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Live session failed.";
+      setError(msg);
+      setStatus("Live session failed");
+      pushLog(`Live session failed: ${msg}`);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const restoreFromEvent = (event: TimelineEvent) => {
+    if (event.payload?.template) {
+      setTemplate(event.payload.template);
+      pushLog("Template restored from timeline event.");
+    }
+    if (event.payload?.section?.spiral_snapshot) {
+      setLatestSpiralState(event.payload.section.spiral_snapshot);
+      pushLog("Spiral state restored from timeline event.");
+    }
+  };
+
+  const replayOscFromEvent = async (event: TimelineEvent) => {
+    if (!event.payload) return;
+    try {
+      await api(apiBase, "/tools/music/push-ableton", {
+        method: "POST",
+        body: JSON.stringify({
+          user_id: userId,
+          session_id: sessionId,
+          prompt: "replay",
+          osc_host: oscHost,
+          osc_port: Number(oscPort),
+          dry_run: false,
+          template_id: selectedTemplateId,
+          template_overrides: template,
+        }),
+      });
+      appendAutonomousDecision({
+        sourceEventId: event.id,
+        action: "replay_osc",
+        reason: "Operator replayed OSC from timeline event.",
+        confidence: 0.9,
+        payload: event.payload,
+      });
+    } catch {
+      pushLog("OSC replay failed.");
+    }
+  };
+
+  const reExportMidiFromEvent = async (event?: TimelineEvent) => {
+    try {
+      await api(apiBase, "/tools/music/export-midi", {
+        method: "POST",
+        body: JSON.stringify({
+          user_id: userId,
+          session_id: sessionId,
+          prompt: livePrompt,
+          energy: Number(energy[0].toFixed(2)),
+        }),
+      });
+      appendAutonomousDecision({
+        sourceEventId: event?.id,
+        action: "re_export_midi",
+        reason: "Operator re-exported MIDI from timeline state.",
+        confidence: 0.88,
+        payload: event?.payload,
+      });
+    } catch {
+      pushLog("MIDI re-export failed.");
+    }
+  };
+
+  const setCompareSlot = (slot: "a" | "b", payload: any) => {
+    setCompareState((prev) => ({ ...prev, [slot]: payload }));
+  };
+
+  const executeAutonomousCycle = async () => {
+    const best = selectBestTimelineEvent();
+    if (!best) {
+      appendAutonomousDecision({
+        action: "prepare_live_session",
+        reason: "No timeline events yet.",
+        confidence: 0.2,
+      });
+      return;
+    }
+
+    if (best.score < qualityThreshold) {
+      appendAutonomousDecision({
+        sourceEventId: best.item.id,
+        action: "prepare_live_session",
+        reason: `Best score ${best.score.toFixed(2)} below threshold ${qualityThreshold.toFixed(2)}.`,
+        confidence: best.score,
+        payload: best.item.payload,
+      });
+      return;
+    }
+
+    const sourceEnergy = Number(energy[0].toFixed(2));
+    const nextEnergy = autoMutateEnergy ? mutatedEnergyFromBest(sourceEnergy) : sourceEnergy;
+    setEnergy([nextEnergy]);
+
+    appendAutonomousDecision({
+      sourceEventId: best.item.id,
+      action: "mutate_energy",
+      reason: `Derived next cycle from ${best.item.type}.`,
+      confidence: best.score,
+      nextEnergy,
+      payload: best.item.payload,
+    });
+
+    try {
+      const data = await api<any>(apiBase, "/tools/music/live-session", {
+        method: "POST",
+        body: JSON.stringify({
+          user_id: userId,
+          session_id: sessionId,
+          prompt: `${livePrompt} autonomous continuation`,
+          energy: nextEnergy,
+          duration_bars: 16,
+          section_name: `${initialSection.section_name}_auto`,
+          output_dir: "exports",
+          osc_host: oscHost,
+          osc_port: Number(oscPort),
+          push_osc: true,
+          export_midi: true,
+          template_id: selectedTemplateId,
+          template_overrides: template,
+          dry_run: dryRun,
+        }),
+      });
+      setLastPayload(data);
+      appendTimeline("autonomous_live_session", "Autonomous loop executed a live-session cycle", data);
+      appendAutonomousDecision({
+        sourceEventId: best.item.id,
+        action: "prepare_live_session",
+        reason: "Autonomous cycle successfully triggered live-session route.",
+        confidence: best.score,
+        nextEnergy,
+        payload: data,
+      });
+    } catch (err) {
+      appendAutonomousDecision({
+        sourceEventId: best.item.id,
+        action: "prepare_live_session",
+        reason: err instanceof Error ? err.message : "Autonomous cycle failed.",
+        confidence: best.score,
+      });
+    }
+  };
+
+  useEffect(() => {
+    if (!autonomousMode) return;
+    const id = window.setInterval(() => {
+      executeAutonomousCycle();
+    }, Math.max(5, loopIntervalSec) * 1000);
+    return () => window.clearInterval(id);
+  }, [autonomousMode, loopIntervalSec, qualityThreshold, autoMutateEnergy, timeline, dryRun, apiBase, sessionId, oscHost, oscPort, livePrompt, selectedTemplateId, template]);
+
+  const requestPreview = {
+    user_id: userId,
+    session_id: sessionId,
+    prompt: livePrompt,
+    energy: Number(energy[0].toFixed(2)),
+    duration_bars: 16,
+    section_name: initialSection.section_name,
+    output_dir: "exports",
+    osc_host: oscHost,
+    osc_port: Number(oscPort),
+    push_osc: true,
+    export_midi: true,
+    template_id: selectedTemplateId,
+    template_overrides: template,
+    dry_run: dryRun,
+  };
+
+  const bestTimelineCandidate = selectBestTimelineEvent();
+
+  return (
+    <div className="min-h-screen bg-background p-4 md:p-8">
+      <div className="mx-auto grid max-w-7xl gap-6">
+        <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} className="grid gap-4 md:grid-cols-[1.3fr_0.7fr]">
+          <Card className="rounded-2xl shadow-sm">
+            <CardHeader>
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <CardTitle className="text-2xl flex items-center gap-2">
+                    <Waves className="h-6 w-6" /> Spiral Ableton Dashboard V5
+                  </CardTitle>
+                  <CardDescription>
+                    Fresh clean V5 with backend wiring, live monitoring, actionable timeline, compare view, and autonomous loop mode.
+                  </CardDescription>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Badge variant="secondary" className="rounded-full px-3 py-1">Backend Wired</Badge>
+                  <Badge variant="outline" className="rounded-full px-3 py-1">Live Route Ready</Badge>
+                  <Badge className={`rounded-full px-3 py-1 border ${connectionColor}`}>{wsConnected ? "WS Live" : "WS Offline"}</Badge>
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent className="grid gap-4 md:grid-cols-5">
+              <div className="rounded-2xl border p-4">
+                <div className="flex items-center gap-2 text-sm font-medium"><Database className="h-4 w-4" /> User</div>
+                <div className="mt-2 text-2xl font-semibold">{userId}</div>
+              </div>
+              <div className="rounded-2xl border p-4">
+                <div className="flex items-center gap-2 text-sm font-medium"><Cable className="h-4 w-4" /> OSC</div>
+                <div className="mt-2 text-2xl font-semibold">{oscHost}:{oscPort}</div>
+              </div>
+              <div className="rounded-2xl border p-4">
+                <div className="flex items-center gap-2 text-sm font-medium"><Activity className="h-4 w-4" /> Messages</div>
+                <div className="mt-2 text-2xl font-semibold">{previewMessages.length}</div>
+              </div>
+              <div className="rounded-2xl border p-4">
+                <div className="flex items-center gap-2 text-sm font-medium"><Disc3 className="h-4 w-4" /> Energy</div>
+                <div className="mt-2 text-2xl font-semibold">{energy[0].toFixed(2)}</div>
+              </div>
+              <div className="rounded-2xl border p-4">
+                <div className="flex items-center gap-2 text-sm font-medium"><Radio className="h-4 w-4" /> Status</div>
+                <div className="mt-2 text-sm font-semibold">{status}</div>
+                <div className="mt-1 text-xs text-muted-foreground">WS: {wsConnected ? "connected" : "disconnected"}</div>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card className="rounded-2xl shadow-sm">
+            <CardHeader>
+              <CardTitle className="text-lg">Launch Panel</CardTitle>
+              <CardDescription>Drive the backend live-session route from the dashboard.</CardDescription>
+            </CardHeader>
+            <CardContent className="grid gap-4">
+              <div className="grid gap-2">
+                <Label>Backend Base URL</Label>
+                <Input value={apiBase} onChange={(e) => setApiBase(e.target.value)} />
+              </div>
+              <div className="grid gap-2">
+                <Label>WebSocket Base URL</Label>
+                <Input value={wsBase} onChange={(e) => setWsBase(e.target.value)} />
+              </div>
+              <div className="grid gap-2">
+                <Label>User ID</Label>
+                <Input value={userId} onChange={(e) => setUserId(e.target.value)} />
+              </div>
+              <div className="grid gap-2">
+                <Label>Session ID</Label>
+                <Input value={sessionId} onChange={(e) => setSessionId(e.target.value)} />
+              </div>
+              <div className="grid gap-2">
+                <Label>Prompt</Label>
+                <Textarea value={livePrompt} onChange={(e) => setLivePrompt(e.target.value)} rows={4} />
+              </div>
+              <div className="grid gap-2">
+                <Label>Energy</Label>
+                <Slider value={energy} onValueChange={setEnergy} min={0} max={1} step={0.01} />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="grid gap-2">
+                  <Label>OSC Host</Label>
+                  <Input value={oscHost} onChange={(e) => setOscHost(e.target.value)} />
+                </div>
+                <div className="grid gap-2">
+                  <Label>OSC Port</Label>
+                  <Input value={oscPort} onChange={(e) => setOscPort(e.target.value)} />
+                </div>
+              </div>
+              <div className="flex items-center justify-between rounded-2xl border p-3">
+                <div>
+                  <div className="font-medium">Dry Run</div>
+                  <div className="text-sm text-muted-foreground">Preview only, do not send live OSC.</div>
+                </div>
+                <Switch checked={dryRun} onCheckedChange={setDryRun} />
+              </div>
+              <div className="grid gap-2">
+                <Button className="rounded-2xl" onClick={launchLiveSession} disabled={isBusy}>
+                  <Play className="mr-2 h-4 w-4" /> {dryRun ? "Run Live Dry-Session" : "Launch Live Session"}
+                </Button>
+                <Button variant="outline" className="rounded-2xl" onClick={runDryPreview} disabled={isBusy}>
+                  <Radio className="mr-2 h-4 w-4" /> Fetch OSC Dry Preview
+                </Button>
+                <Button variant="outline" className="rounded-2xl" onClick={loadUserTemplates} disabled={isBusy}>
+                  <RefreshCcw className="mr-2 h-4 w-4" /> Reload Saved Templates
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </motion.div>
+
+        {error ? (
+          <Alert className="rounded-2xl">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        ) : null}
+
+        <Card className="rounded-2xl shadow-sm">
+          <CardHeader>
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <CardTitle className="text-lg flex items-center gap-2"><Bot className="h-5 w-5" /> Autonomous Loop Mode</CardTitle>
+                <CardDescription>Continuously mine strong timeline states and evolve the next live-session automatically.</CardDescription>
+              </div>
+              <Badge className={`rounded-full px-3 py-1 border ${autonomousMode ? "bg-emerald-500/15 text-emerald-700 border-emerald-500/30" : "bg-muted text-muted-foreground border-border"}`}>
+                {autonomousMode ? "Autonomous On" : "Autonomous Off"}
+              </Badge>
+            </div>
+          </CardHeader>
+          <CardContent className="grid gap-4 md:grid-cols-4">
+            <div className="rounded-2xl border p-4">
+              <div className="text-sm font-medium">Loop Interval</div>
+              <div className="mt-2 flex items-center gap-3">
+                <Input type="number" value={loopIntervalSec} onChange={(e) => setLoopIntervalSec(Number(e.target.value || 12))} />
+                <span className="text-sm text-muted-foreground">sec</span>
+              </div>
+            </div>
+            <div className="rounded-2xl border p-4">
+              <div className="text-sm font-medium">Quality Threshold</div>
+              <div className="mt-3">
+                <Slider value={[qualityThreshold]} onValueChange={(v) => setQualityThreshold(Number(v[0].toFixed(2)))} min={0} max={1} step={0.01} />
+                <div className="mt-2 text-sm text-muted-foreground">{qualityThreshold.toFixed(2)}</div>
+              </div>
+            </div>
+            <div className="rounded-2xl border p-4 flex items-center justify-between">
+              <div>
+                <div className="text-sm font-medium">Mutate Energy</div>
+                <div className="text-sm text-muted-foreground">Vary the next generation from the best state.</div>
+              </div>
+              <Switch checked={autoMutateEnergy} onCheckedChange={setAutoMutateEnergy} />
+            </div>
+            <div className="rounded-2xl border p-4 flex items-center justify-between">
+              <div>
+                <div className="text-sm font-medium">Autonomous Mode</div>
+                <div className="text-sm text-muted-foreground">Run live-session cycles automatically.</div>
+              </div>
+              <Switch checked={autonomousMode} onCheckedChange={setAutonomousMode} />
+            </div>
+            <div className="md:col-span-4 flex flex-wrap gap-2">
+              <Button className="rounded-2xl" onClick={executeAutonomousCycle}>
+                <Sparkles className="mr-2 h-4 w-4" /> Run Autonomous Cycle Now
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} className="grid gap-4 md:grid-cols-4">
+          <Card className="rounded-2xl shadow-sm">
+            <CardHeader>
+              <CardTitle className="text-base">Latest Spiral State</CardTitle>
+              <CardDescription>Most recent spiral snapshot from session activity.</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <pre className="min-h-[180px] overflow-x-auto rounded-2xl border p-3 text-xs">{JSON.stringify(latestSpiralState, null, 2)}</pre>
+            </CardContent>
+          </Card>
+
+          <Card className="rounded-2xl shadow-sm">
+            <CardHeader>
+              <CardTitle className="text-base">Latest OSC Push</CardTitle>
+              <CardDescription>Most recent Ableton OSC push result.</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <pre className="min-h-[180px] overflow-x-auto rounded-2xl border p-3 text-xs">{JSON.stringify(latestOscPush, null, 2)}</pre>
+            </CardContent>
+          </Card>
+
+          <Card className="rounded-2xl shadow-sm">
+            <CardHeader>
+              <CardTitle className="text-base">Latest MIDI Export</CardTitle>
+              <CardDescription>Most recent MIDI export result.</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <pre className="min-h-[180px] overflow-x-auto rounded-2xl border p-3 text-xs">{JSON.stringify(latestMidiExport, null, 2)}</pre>
+            </CardContent>
+          </Card>
+
+          <Card className="rounded-2xl shadow-sm">
+            <CardHeader>
+              <CardTitle className="text-base">Current Mode + Last Reply</CardTitle>
+              <CardDescription>Latest response state from the spiral brain.</CardDescription>
+            </CardHeader>
+            <CardContent className="grid gap-3">
+              <div className={`rounded-2xl border p-3 ${modeColor(currentMode)}`}>
+                <div className="text-xs opacity-80">Current Mode</div>
+                <div className="mt-1 flex items-center gap-2 text-lg font-semibold">
+                  <Orbit className="h-4 w-4" /> {currentMode}
+                </div>
+              </div>
+              <div className="rounded-2xl border p-3">
+                <div className="text-xs text-muted-foreground">Last Reply</div>
+                <div className="mt-1 text-sm">{lastReply}</div>
+              </div>
+            </CardContent>
+          </Card>
+        </motion.div>
+
+        <Tabs defaultValue="template" className="grid gap-6">
+          <TabsList className="w-full justify-start rounded-2xl flex-wrap">
+            <TabsTrigger value="template">Template Editor</TabsTrigger>
+            <TabsTrigger value="preview">OSC Preview</TabsTrigger>
+            <TabsTrigger value="request">Route Payload</TabsTrigger>
+            <TabsTrigger value="response">Backend Response</TabsTrigger>
+            <TabsTrigger value="logs">Logs</TabsTrigger>
+            <TabsTrigger value="events">WS Events</TabsTrigger>
+            <TabsTrigger value="timeline">Timeline</TabsTrigger>
+            <TabsTrigger value="compare">Compare</TabsTrigger>
+            <TabsTrigger value="autonomous">Autonomous</TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="template" className="grid gap-6 md:grid-cols-[1.2fr_0.8fr]">
+            <Card className="rounded-2xl shadow-sm">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2"><Settings2 className="h-5 w-5" /> Template Editor</CardTitle>
+                <CardDescription>Edit mappings and save them through backend persistence.</CardDescription>
+              </CardHeader>
+              <CardContent className="grid gap-6">
+                <div className="grid gap-2">
+                  <Label>Template Name</Label>
+                  <Input value={template.name} onChange={(e) => setTemplate((prev) => ({ ...prev, name: e.target.value }))} />
+                </div>
+
+                <div className="flex items-center justify-between rounded-2xl border p-3">
+                  <div>
+                    <div className="font-medium">Launch On Push</div>
+                    <div className="text-sm text-muted-foreground">Fire target clips automatically after naming.</div>
+                  </div>
+                  <Switch checked={template.launch_on_push} onCheckedChange={(checked) => setTemplate((prev) => ({ ...prev, launch_on_push: checked }))} />
+                </div>
+
+                <div className="grid gap-3">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-lg font-semibold">Tracks</h3>
+                    <Button variant="outline" className="rounded-2xl" onClick={addTrack}>Add Track</Button>
+                  </div>
+                  {Object.entries(template.tracks).map(([role, cfg]) => (
+                    <div key={role} className="grid gap-3 rounded-2xl border p-4 md:grid-cols-4">
+                      <div className="grid gap-2">
+                        <Label>{role} Name Suffix</Label>
+                        <Input value={cfg.name_suffix} onChange={(e) => updateTrack(role, "name_suffix", e.target.value)} />
+                      </div>
+                      <div className="grid gap-2">
+                        <Label>Track Index</Label>
+                        <Input value={cfg.track_index} onChange={(e) => updateTrack(role, "track_index", e.target.value)} />
+                      </div>
+                      <div className="grid gap-2">
+                        <Label>Clip Index</Label>
+                        <Input value={cfg.clip_index} onChange={(e) => updateTrack(role, "clip_index", e.target.value)} />
+                      </div>
+                      <div className="flex items-end">
+                        <Badge variant="secondary" className="rounded-full">{role}</Badge>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <Separator />
+
+                <div className="grid gap-3">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-lg font-semibold">Macros</h3>
+                    <Button variant="outline" className="rounded-2xl" onClick={addMacro}>Add Macro</Button>
+                  </div>
+                  {Object.entries(template.macros).map(([name, cfg]) => (
+                    <div key={name} className="grid gap-3 rounded-2xl border p-4 md:grid-cols-4">
+                      <div className="flex items-end">
+                        <Badge variant="outline" className="rounded-full">{name}</Badge>
+                      </div>
+                      <div className="grid gap-2">
+                        <Label>Track Index</Label>
+                        <Input value={cfg.track_index} onChange={(e) => updateMacro(name, "track_index", e.target.value)} />
+                      </div>
+                      <div className="grid gap-2">
+                        <Label>Device Index</Label>
+                        <Input value={cfg.device_index} onChange={(e) => updateMacro(name, "device_index", e.target.value)} />
+                      </div>
+                      <div className="grid gap-2">
+                        <Label>Parameter Index</Label>
+                        <Input value={cfg.parameter_index} onChange={(e) => updateMacro(name, "parameter_index", e.target.value)} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="flex flex-wrap gap-2">
+                  <Button className="rounded-2xl" onClick={saveTemplate} disabled={isBusy}>
+                    <Save className="mr-2 h-4 w-4" /> Save to Backend
+                  </Button>
+                  <Button variant="outline" className="rounded-2xl" onClick={validateWithBackend} disabled={isBusy}>
+                    <Send className="mr-2 h-4 w-4" /> Backend Validate
+                  </Button>
+                  <Button variant="outline" className="rounded-2xl" onClick={deleteTemplate} disabled={isBusy || !selectedTemplateId}>
+                    Delete Selected Saved Template
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+
+            <div className="grid gap-6">
+              <Card className="rounded-2xl shadow-sm">
+                <CardHeader>
+                  <CardTitle>Validation</CardTitle>
+                  <CardDescription>Compare local checks with backend validation.</CardDescription>
+                </CardHeader>
+                <CardContent className="grid gap-4">
+                  <div className="rounded-2xl border p-4">
+                    <div className="font-medium">Local validation</div>
+                    {validationErrors.length === 0 ? (
+                      <div className="mt-2 text-sm text-muted-foreground">No local errors.</div>
+                    ) : (
+                      <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+                        {validationErrors.map((err) => <li key={err}>{err}</li>)}
+                      </ul>
+                    )}
+                  </div>
+                  <div className="rounded-2xl border p-4">
+                    <div className="font-medium">Backend validation</div>
+                    {backendValidation.length === 0 ? (
+                      <div className="mt-2 text-sm text-muted-foreground">No backend validation errors currently loaded.</div>
+                    ) : (
+                      <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+                        {backendValidation.map((err) => <li key={err}>{err}</li>)}
+                      </ul>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card className="rounded-2xl shadow-sm">
+                <CardHeader>
+                  <CardTitle>Template Library</CardTitle>
+                  <CardDescription>Built-ins plus your saved backend templates.</CardDescription>
+                </CardHeader>
+                <CardContent className="grid gap-4">
+                  <div>
+                    <div className="mb-2 font-medium">Built-in</div>
+                    <div className="flex flex-wrap gap-2">
+                      {builtInTemplates.map((item) => (
+                        <Button key={item.name} variant="outline" className="rounded-2xl" onClick={() => loadBuiltIn(item.name)}>
+                          Load {item.name}
+                        </Button>
+                      ))}
+                    </div>
+                  </div>
+                  <Separator />
+                  <div>
+                    <div className="mb-2 font-medium">Saved in backend</div>
+                    <div className="grid gap-2">
+                      {savedTemplates.length === 0 ? (
+                        <div className="text-sm text-muted-foreground">No saved templates for this user yet.</div>
+                      ) : (
+                        savedTemplates.map((item) => (
+                          <button key={item.template_id || item.name} onClick={() => loadSavedTemplate(item)} className="rounded-2xl border p-3 text-left hover:bg-muted">
+                            <div className="font-medium">{item.name}</div>
+                            <div className="text-xs text-muted-foreground">{item.template_id || "no-id"}</div>
+                          </button>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+          </TabsContent>
+
+          <TabsContent value="preview">
+            <Card className="rounded-2xl shadow-sm">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2"><Send className="h-5 w-5" /> OSC Message Preview</CardTitle>
+                <CardDescription>Dry-run preview from the backend route.</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <ScrollArea className="h-[520px] rounded-2xl border p-4">
+                  <div className="grid gap-3">
+                    {previewMessages.map((msg, index) => (
+                      <div key={`${msg.address}-${index}`} className="rounded-2xl border p-3">
+                        <div className="font-mono text-sm">{msg.address}</div>
+                        <div className="mt-1 text-sm text-muted-foreground">{JSON.stringify(msg.args)}</div>
+                      </div>
+                    ))}
+                  </div>
+                </ScrollArea>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="request">
+            <Card className="rounded-2xl shadow-sm">
+              <CardHeader>
+                <CardTitle>Backend Route Payload</CardTitle>
+                <CardDescription>Payload sent to `/tools/music/live-session`.</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <pre className="overflow-x-auto rounded-2xl border p-4 text-sm">{JSON.stringify(requestPreview, null, 2)}</pre>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="response">
+            <Card className="rounded-2xl shadow-sm">
+              <CardHeader>
+                <CardTitle>Backend Response</CardTitle>
+                <CardDescription>Most recent response from validate, preview, or live-session routes.</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <pre className="overflow-x-auto rounded-2xl border p-4 text-sm min-h-[320px]">{JSON.stringify(lastPayload, null, 2)}</pre>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="logs">
+            <Card className="rounded-2xl shadow-sm">
+              <CardHeader>
+                <CardTitle>Session Log</CardTitle>
+                <CardDescription>Operator log for template work and route calls.</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <ScrollArea className="h-[420px] rounded-2xl border p-4">
+                  <div className="grid gap-2">
+                    {log.map((entry, idx) => (
+                      <div key={`${entry}-${idx}`} className="rounded-xl border p-3 text-sm">{entry}</div>
+                    ))}
+                  </div>
+                </ScrollArea>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="events">
+            <Card className="rounded-2xl shadow-sm">
+              <CardHeader>
+                <CardTitle>WebSocket Events</CardTitle>
+                <CardDescription>Realtime updates from the backend session channel.</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <ScrollArea className="h-[420px] rounded-2xl border p-4">
+                  <div className="grid gap-2">
+                    {wsEvents.length === 0 ? (
+                      <div className="text-sm text-muted-foreground">No WebSocket events received yet.</div>
+                    ) : (
+                      wsEvents.map((event, idx) => (
+                        <div key={idx} className="rounded-xl border p-3 text-sm">
+                          <div className="font-medium">{event.type || "event"}</div>
+                          <pre className="mt-2 overflow-x-auto text-xs">{JSON.stringify(event, null, 2)}</pre>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </ScrollArea>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="timeline">
+            <Card className="rounded-2xl shadow-sm">
+              <CardHeader>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <CardTitle>Session Timeline</CardTitle>
+                    <CardDescription>Actionable timeline for the full spiral session.</CardDescription>
+                  </div>
+                  <Button variant="outline" className="rounded-2xl" onClick={() => setTimeline([])}>
+                    <TimerReset className="mr-2 h-4 w-4" /> Clear Timeline
+                  </Button>
+                </div>
+              </CardHeader>
+              <CardContent>
+                <ScrollArea className="h-[520px] rounded-2xl border p-4">
+                  <div className="grid gap-3">
+                    {timeline.length === 0 ? (
+                      <div className="text-sm text-muted-foreground">No timeline entries yet.</div>
+                    ) : (
+                      timeline.map((item) => (
+                        <div key={item.id} className="rounded-2xl border p-4">
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="flex items-center gap-2">
+                              <Badge>{item.type}</Badge>
+                              <span className="font-medium">{item.summary}</span>
+                            </div>
+                            <span className="text-xs text-muted-foreground">{item.ts}</span>
+                          </div>
+
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            <Button size="sm" variant="outline" onClick={() => restoreFromEvent(item)}>Restore</Button>
+                            <Button size="sm" variant="outline" onClick={() => replayOscFromEvent(item)}>Replay OSC</Button>
+                            <Button size="sm" variant="outline" onClick={() => reExportMidiFromEvent(item)}>Re-export MIDI</Button>
+                            <Button size="sm" variant="outline" onClick={() => setCompareSlot("a", item.payload)}>Set A</Button>
+                            <Button size="sm" variant="outline" onClick={() => setCompareSlot("b", item.payload)}>Set B</Button>
+                          </div>
+
+                          <pre className="mt-3 overflow-x-auto rounded-xl border p-3 text-xs">{JSON.stringify(item.payload, null, 2)}</pre>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </ScrollArea>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="compare">
+            <Card className="rounded-2xl shadow-sm">
+              <CardHeader>
+                <CardTitle>Compare States</CardTitle>
+                <CardDescription>Compare two timeline payloads side by side.</CardDescription>
+              </CardHeader>
+              <CardContent className="grid gap-4 md:grid-cols-2">
+                <pre className="rounded-2xl border p-3 text-xs overflow-x-auto">{JSON.stringify(compareState.a, null, 2)}</pre>
+                <pre className="rounded-2xl border p-3 text-xs overflow-x-auto">{JSON.stringify(compareState.b, null, 2)}</pre>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="autonomous">
+            <Card className="rounded-2xl shadow-sm">
+              <CardHeader>
+                <CardTitle>Autonomous Loop Inspector</CardTitle>
+                <CardDescription>Inspect how the system chooses source states and what it does next.</CardDescription>
+              </CardHeader>
+              <CardContent className="grid gap-4 md:grid-cols-2">
+                <div className="rounded-2xl border p-4">
+                  <div className="mb-2 font-medium">Best Timeline Candidate</div>
+                  <pre className="text-xs overflow-x-auto">{JSON.stringify(bestTimelineCandidate, null, 2)}</pre>
+                </div>
+                <div className="rounded-2xl border p-4">
+                  <div className="mb-2 font-medium">Latest Autonomous Payload</div>
+                  <pre className="text-xs overflow-x-auto">{JSON.stringify(autonomousLog[0] || null, null, 2)}</pre>
+                </div>
+                <div className="md:col-span-2 rounded-2xl border p-4">
+                  <div className="mb-3 font-medium">Autonomous Decisions</div>
+                  <ScrollArea className="h-[260px]">
+                    <div className="grid gap-2 pr-3">
+                      {autonomousLog.length === 0 ? (
+                        <div className="text-sm text-muted-foreground">No autonomous decisions yet.</div>
+                      ) : (
+                        autonomousLog.map((item) => (
+                          <div key={item.id} className="rounded-xl border p-3 text-sm">
+                            <div className="flex items-center justify-between gap-3">
+                              <div className="font-medium">{item.action}</div>
+                              <div className="text-xs text-muted-foreground">{item.ts}</div>
+                            </div>
+                            <div className="mt-1 text-muted-foreground">{item.reason}</div>
+                            <div className="mt-2 text-xs">confidence: {item.confidence.toFixed(2)}{typeof item.nextEnergy === "number" ? ` • nextEnergy: ${item.nextEnergy.toFixed(2)}` : ""}</div>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </ScrollArea>
+                </div>
+              </CardContent>
+            </Card>
+          </TabsContent>
+        </Tabs>
+      </div>
+    </div>
+  );
+}
